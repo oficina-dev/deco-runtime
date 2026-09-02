@@ -188,6 +188,7 @@ const wrapLoader = (
   }: LoaderModule,
   resolveChain: FieldResolver[],
   release: DecofileProvider,
+  blockKey: string,
 ) => {
   const [cacheMaxAge, mode] = typeof cache === "string"
     ? [MAX_AGE_S, cache]
@@ -208,7 +209,19 @@ const wrapLoader = (
       req: Request,
       ctx: FnContext<State, any>,
     ): Promise<ReturnType<typeof handler>> => {
-      const loader = ctx.resolverId || "unknown";
+      // The module key, not ctx.resolverId. resolverId is the PATH walked to get
+      // here, so the same loader with the same cacheKey gets a different entry per
+      // caller: a decofile block resolves as "<page>@sections.N..." while
+      // POST /live/invoke resolves as "obj". That split made the site and the
+      // mobile app compute the very same payload twice. The module key is stable
+      // within a deploy (a literal in manifest.gen.ts) and identical from every
+      // caller, so both now read the same entry.
+      //
+      // What this shifts onto cacheKey: two INSTANCES of the same module (two
+      // decofile blocks, different props) used to be told apart by resolverId.
+      // Now only cacheKey separates them — it must encode every prop that
+      // changes the result.
+      const loader = blockKey;
       const start = performance.now();
       let status: "bypass" | "miss" | "stale" | "hit" | undefined;
 
@@ -365,7 +378,7 @@ const loaderBlock: Block<LoaderModule> = {
     wrapCaughtErrors,
     (props: TProps, ctx: HttpContext<{ global: any } & RequestState>) =>
       applyProps(
-        wrapLoader(mod, ctx.resolveChain, ctx.context.state.release),
+        wrapLoader(mod, ctx.resolveChain, ctx.context.state.release, key),
       )(
         props,
         ctx,

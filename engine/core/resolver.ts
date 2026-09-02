@@ -466,8 +466,21 @@ const invokeResolverWithProps = async <
 
   // TODO: (@tlgimenes) create resolverId outside of the request cycle
   const resolverId = resolverIdFromResolveChain(ctx.resolveChain);
-  const timing = resolverId
-    ? ctx.monitoring?.timings.start(resolverId)
+
+  // Telemetry name only. Anything reached through invoke collapses its chain to
+  // "obj" (or "<prop>.obj" for a batch), which makes every Server-Timing entry
+  // under ?__d anonymous. __resolveType is the manifest key of what is actually
+  // running, so use it when the chain has nothing to say.
+  //
+  // This renames the LABEL, never the identity: `resolverId` below is still
+  // passed untouched to the resolver, and blocks/loader.ts keys the cache off
+  // the module key, not off this.
+  const timingName = !resolverId || resolverId === "obj" ||
+      resolverId.endsWith(".obj")
+    ? __resolveType
+    : resolverId;
+  const timing = timingName
+    ? ctx.monitoring?.timings.start(timingName)
     : undefined;
 
   // Shallow copy to avoid resolvers getting the currentSpan from one another
