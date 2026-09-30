@@ -11,6 +11,15 @@ import {
   type DecofileProvider,
   getProvider,
 } from "../engine/decofile/provider.ts";
+import {
+  applyDraftCookie,
+  DRAFT_QUERY_PARAM,
+  draftPointerFromRequest,
+  resolveDraftForRequest,
+  setDecoSiteHost,
+} from "../engine/decofile/draft.ts";
+import { fromJSON } from "../engine/decofile/fetcher.ts";
+import { DRAFT_PREVIEW_KEY } from "./draftBadge.ts";
 import { siteNameFromEnv } from "../engine/manifest/manifest.ts";
 import { randomSiteName } from "../engine/manifest/utils.ts";
 import { newContext, type PreactComponent, type Resolvable } from "../mod.ts";
@@ -78,7 +87,12 @@ export class Deco<TAppManifest extends AppManifest = AppManifest> {
   static async init<TAppManifest extends AppManifest = AppManifest>(
     opts?: DecoOptions<TAppManifest>,
   ): Promise<Deco<TAppManifest>> {
-    const site = opts?.site ?? siteNameFromEnv() ?? randomSiteName();
+    const resolvedSite = opts?.site ?? siteNameFromEnv();
+    const site = resolvedSite ?? randomSiteName();
+    // Allow drafts to preview on the deco-hosted `<site>.deco.site` domain out
+    // of the box. Skipped for the random dev fallback (an unnamed site is not a
+    // preview host); a custom production domain is never inferred.
+    setDecoSiteHost(resolvedSite);
     const decofile = opts?.decofile ?? (await getProvider());
     const manifest = opts?.manifest ??
       (await import(toFileUrl(join(Deno.cwd(), "manifest.gen.ts")).href).then(
@@ -239,7 +253,44 @@ export class Deco<TAppManifest extends AppManifest = AppManifest> {
     state.global = state;
     const { resolver } = await this.ctx.runtime!;
 
-    const ctxResolver = resolver
+    // --- Fast Preview: request-scoped draft snapshot ---------------------
+    // If this request carries a valid `?__draft=` pointer (or the cookie that
+    // carries it across navigation) from an allowed host, pull the draft
+    // decofile from Studio's decofile API and render THIS request against it,
+    // instead of the published release. Replacing the release wholesale gives
+    // snapshot semantics for free: a block the draft omits is gone, not
+    // resurrected by the base. Inert (no network, no allocation) on any
+    // request without a pointer or on a non-preview host.
+    let activeResolver = resolver;
+    const draftDecofile = await resolveDraftForRequest(request).catch(() =>
+      null
+    );
+    if (draftDecofile) {
+      const draftProvider = fromJSON(draftDecofile);
+      state.release = draftProvider;
+      activeResolver = resolver.with({ release: draftProvider });
+      // A draft shares the published URL — it must never be cached or indexed.
+      // `shouldCache = false` drives the framework's cache decision to
+      // `no-store` (see applyPageCacheDecision); noindex keeps a leaked draft
+      // out of search results.
+      state.vary.shouldCache = false;
+      response.headers.set("x-robots-tag", "noindex, nofollow");
+      // Carry the active pointer to the middleware so it can inject the draft
+      // badge into the HTML response. Bag, not a header: the pointer stays
+      // server-side (the cookie is HttpOnly) and never touches the wire except
+      // inside the badge's own copy-link handler.
+      const activePointer = draftPointerFromRequest(request);
+      if (activePointer) state.bag.set(DRAFT_PREVIEW_KEY, activePointer);
+    }
+    // Persist the pointer into a cookie so client-fetched sections
+    // (`/deco/render`, `/deco/invoke`) carry the same draft; `off` clears it.
+    // Only relevant when a `?__draft=` param is present — skip the work (and a
+    // second URL parse) for the vast majority of requests that have none.
+    if (state.url.searchParams.has(DRAFT_QUERY_PARAM)) {
+      applyDraftCookie(request, response.headers);
+    }
+
+    const ctxResolver = activeResolver
       .resolverFor(
         {
           context: new Proxy(context, {
@@ -259,7 +310,7 @@ export class Deco<TAppManifest extends AppManifest = AppManifest> {
           monitoring: state.monitoring,
         },
       )
-      .bind(resolver);
+      .bind(activeResolver);
 
     state.resolve = ctxResolver;
     state.invoke = buildInvokeFunc(
