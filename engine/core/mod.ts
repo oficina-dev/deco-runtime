@@ -90,6 +90,13 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
   private resolveHints: ResolveHints;
   private _cachedResolvers: ResolverMap<BaseContext> | null = null;
   private _resolveIdCounter = 0;
+  /**
+   * Subscription to the release's `onChange`. Kept so it can be disposed when
+   * this resolver is replaced — otherwise every superseded resolver stays
+   * reachable from the provider's listener list and leaks its whole
+   * `resolvables`/`resolvers`/`resolveHints` graph.
+   */
+  private releaseSubscription: Disposable | undefined;
   constructor(
     config: ResolverOptions<TContext>,
     hints?: ResolveHints,
@@ -101,7 +108,7 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
     this.danglingRecover = config.danglingRecover;
     this.resolveHints = hints ?? {};
     this.runOncePerRelease = oncePerRelease ?? {};
-    this.release.onChange(() => {
+    this.releaseSubscription = this.release.onChange(() => {
       dispatchEvent(new Event("deco:hmr"));
       this.runOncePerRelease = {};
       this.resolveHints = {};
@@ -109,23 +116,61 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
     });
   }
 
+  /**
+   * Unsubscribes this resolver from its release.
+   *
+   * `installApps` rebuilds the resolver on every decofile change
+   * (`currentResolver = currentResolver.with({ resolvers, resolvables })`), and
+   * each `new ReleaseResolver` subscribes to the same provider. Without
+   * dropping the previous subscription the superseded resolver is still
+   * referenced by the provider's listener list and can never be collected, so
+   * every publish permanently retains one full resolver graph.
+   *
+   * Safe to call on a superseded resolver: in-flight requests holding a
+   * reference keep working, they simply stop being notified of release changes
+   * they no longer serve. Idempotent.
+   */
+  public dispose = (): void => {
+    this.releaseSubscription?.[Symbol.dispose]();
+    this.releaseSubscription = undefined;
+  };
+
+  /**
+   * Alias, not a forwarding method: a prototype method that calls
+   * `this.dispose()` throws once it is detached from the instance
+   * (`const d = resolver[Symbol.dispose]; d()`), while the bound field above
+   * survives it.
+   */
+  readonly [Symbol.dispose] = this.dispose;
+
   public with = (
     { resolvers, resolvables, release, danglingRecover }: ExtensionOptions<
       TContext
     >,
-  ): ReleaseResolver<TContext> =>
-    new ReleaseResolver<TContext>(
+  ): ReleaseResolver<TContext> => {
+    // Hints are derived from the release's resolvables and cached by resolveType
+    // (block id). When the release is swapped — as Fast Preview does to bind a
+    // request-scoped draft (`resolver.with({ release: draftProvider })`) — the
+    // base hints are stale: the SAME block id can now resolve to different
+    // content (e.g. a page whose `sections` was a plain array in the published
+    // release but a `multivariate` flag in the draft). Inheriting them makes the
+    // draft resolve against the published shape and silently drop everything the
+    // old hints don't cover. This mirrors the `release.onChange` invariant in the
+    // constructor, which already clears hints whenever the release changes.
+    const releaseChanged = release !== undefined && release !== this.release;
+    return new ReleaseResolver<TContext>(
       {
         release: release ?? this.release,
         danglingRecover: danglingRecover ?? this.danglingRecover,
         resolvables: { ...this.resolvables, ...resolvables },
         resolvers: { ...this.resolvers, ...resolvers },
       },
-      { ...this.resolveHints },
+      releaseChanged ? {} : { ...this.resolveHints },
       {
         ...this.runOncePerRelease,
       },
     );
+  };
 
   public getResolvers(): ResolverMap<BaseContext> {
     return this._cachedResolvers ??= {

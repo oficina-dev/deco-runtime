@@ -1,5 +1,6 @@
 // deno-lint-ignore-file no-explicit-any
 import type { Context, Span, Tracer } from "../../deps.ts";
+import { RequestContext } from "../../deco.ts";
 import { identity } from "../../utils/object.ts";
 import type { createServerTimings } from "../../utils/timings.ts";
 import { type HintNode, type ResolveHints, traverseAny } from "./hints.ts";
@@ -530,6 +531,17 @@ const invokeResolverWithProps = async <
 };
 
 /**
+ * True when `err` is an abort caused by an aborted `AbortSignal`
+ * (`signal.throwIfAborted()` / `AbortController.abort()`), whose default reason
+ * is a `DOMException` named `"AbortError"`. Custom reasons that preserve that
+ * name match too.
+ */
+const isAbortError = (err: unknown): boolean =>
+  (err instanceof DOMException && err.name === "AbortError") ||
+  (typeof err === "object" && err !== null && "name" in err &&
+    (err as { name?: unknown }).name === "AbortError");
+
+/**
  * Receives the props resolved and a type that should be called with the given props.
  * This type can be a resolvable which currently just ignore the resolved props and returns the given resolved resolvable.
  * If the type wasn't found, it will throw a DanglingReference or calls it recover if configured.
@@ -546,11 +558,32 @@ const resolveWithType = <
   const { resolvers: resolverMap, resolvables } = context;
 
   if (resolveType in resolvables) {
-    return context.memo[resolveType] ??= resolveResolvable<T>(
+    // A caller resolving under an already-aborted RequestContext signal (e.g.
+    // `website/sections/Rendering/Lazy.tsx`, which deliberately aborts to
+    // render a loading fallback fast) must NOT touch the shared memo: its
+    // resolution is doomed to reject, and caching that rejection — or handing
+    // the aborted caller a live consumer's in-flight promise — poisons the
+    // block for every other reference on the page. That is what makes a
+    // multivariate page with more than one variant render blank in preview.
+    // Resolve it standalone so the memo only ever holds the real render's
+    // resolution. Nested resolutions inherit the same aborted signal, so the
+    // whole aborted subtree bypasses the memo too.
+    if (RequestContext.signal?.aborted === true) {
+      return resolveResolvable<T>(resolveType, context, opts);
+    }
+    // Otherwise memoize, but still evict the entry if the resolution rejects
+    // because the signal aborts mid-flight, so a later live read re-resolves
+    // instead of inheriting a cached rejection.
+    return (context.memo[resolveType] ??= resolveResolvable<T>(
       resolveType,
       context,
       opts,
-    );
+    ).catch((err: unknown) => {
+      if (isAbortError(err) && context.memo[resolveType] !== undefined) {
+        delete context.memo[resolveType];
+      }
+      throw err;
+    }));
   } else if (resolveType in resolverMap) {
     const resolver = resolverMap[resolveType];
     const proceed = () =>
