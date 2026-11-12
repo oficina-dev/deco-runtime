@@ -72,11 +72,24 @@ export interface LoaderModule<
   /**
    * Decides whether a result the loader just produced may be written to the
    * loader cache. Runs right before the write, both on a cache miss and on the
-   * background revalidation of a stale entry. Returning `false` hands the
-   * result to the caller without storing it, and leaves any existing entry
-   * untouched: after a miss the next request runs the loader again; after a
-   * revalidation the previous entry keeps being served (and revalidated) until
-   * an accepted result replaces it.
+   * background revalidation of a stale entry; never on the bypass paths
+   * (`no-store`, `no-cache`, a null `cacheKey`, cache disabled), which do not
+   * write. Returning `false` (a veto) hands the result to the caller without
+   * storing it, and leaves any existing entry untouched:
+   * - After a miss, the next request runs the loader again. The response that
+   *   carries the vetoed result also gets `ctx.vary.shouldCache = false`, as a
+   *   `no-store` loader would, so the page and render caches do not keep it
+   *   either.
+   * - After a revalidation, the previous entry keeps being served (and
+   *   revalidated on each read) for as long as the cache engine retains the
+   *   stale entry. The rejected result never rewrites it, so its lifetime is
+   *   still the one set when it was stored: the LRU (FILE_SYSTEM) and REDIS
+   *   engines evict it `STALE_TTL_PERIOD` after it expires (30 s by default),
+   *   and from then on each request is a miss until a result is accepted.
+   *
+   * A veto counts as `status: "vetoed"` in the `loader_cache` counter, on top
+   * of the miss or stale read that led to it, and a vetoed miss shows as
+   * `miss-vetoed` in the loader's Server-Timing entry.
    *
    * Use it for answers that are valid to show once but harmful to repeat, such
    * as an empty search result caused by a transient upstream failure — without
@@ -99,6 +112,8 @@ interface LoaderDebugData extends DebugProperties {
   reason: {
     cache: NonNullable<CacheMode>;
     cacheKeyNull: boolean;
+    /** The loader's `shouldCache` rejected this request's result. */
+    vetoed?: boolean;
   };
 }
 
@@ -223,7 +238,9 @@ export const wrapLoader = (
   const [cacheMaxAge, mode] = typeof cache === "string"
     ? [MAX_AGE_S, cache]
     : [cache?.maxAge, "stale-while-revalidate"];
-  const flights = singleFlight();
+  const flights = singleFlight<
+    { json: Awaited<ReturnType<typeof handler>>; vetoed: boolean }
+  >();
   const bgFlights = singleFlight();
 
   if (typeof singleFlightKey === "function") {
@@ -254,6 +271,17 @@ export const wrapLoader = (
       const loader = blockKey;
       const start = performance.now();
       let status: "bypass" | "miss" | "stale" | "hit" | undefined;
+      let vetoed = false;
+
+      // Keeps this response out of the page and render caches, and tells a
+      // `?__d` debug request which loader did it and why.
+      const markResponseUncacheable = (reason: LoaderDebugData["reason"]) => {
+        if (!ctx.vary) return;
+        ctx.vary.shouldCache = false;
+        const resolver = resolveChain.at(-1);
+        ctx.debugEnabled && resolver &&
+          ctx.vary.debug.push<LoaderDebugData>({ resolver, reason });
+      };
 
       const loaderCache = getCache();
       const isCacheEngineDefined = isCache(loaderCache);
@@ -278,20 +306,11 @@ export const wrapLoader = (
         ) {
           const shouldNotCache = isCacheNoStore || isCacheKeyNull;
 
-          if (ctx.vary && shouldNotCache) {
-            ctx.vary.shouldCache = false;
-
-            if (ctx.debugEnabled) {
-              const resolver = resolveChain.at(-1);
-              resolver &&
-                ctx.vary.debug.push<LoaderDebugData>({
-                  resolver,
-                  reason: {
-                    cache: mode as CacheMode,
-                    cacheKeyNull: isCacheKeyNull,
-                  },
-                });
-            }
+          if (shouldNotCache) {
+            markResponseUncacheable({
+              cache: mode as CacheMode,
+              cacheKeyNull: isCacheKeyNull,
+            });
           }
           !shouldNotCache && ctx.vary?.push(cacheKeyValue);
 
@@ -329,11 +348,15 @@ export const wrapLoader = (
         })}`;
         const request = new Request(cacheKeyUrl);
 
+        // `vetoed` travels with the result because a miss is single-flighted:
+        // every caller that joined the flight gets this result, and each one
+        // must mark its own response uncacheable.
         const callHandlerAndCache = async () => {
           const json = await handler(props, req, ctx);
 
           if (shouldCache && !shouldCache(json, props, req, ctx)) {
-            return json;
+            stats.cache.add(1, { status: "vetoed", loader });
+            return { json, vetoed: true };
           }
 
           // Serialize and encode once on the main thread.
@@ -358,7 +381,7 @@ export const wrapLoader = (
             }),
           ).catch((error) => logger.error(`loader error ${error}`));
 
-          return json;
+          return { json, vetoed: false };
         };
 
         const staleWhileRevalidate = async () => {
@@ -390,16 +413,27 @@ export const wrapLoader = (
             stats.cache.add(1, { status, loader });
           }
 
-          return await matched.json();
+          // A stale read serves the stored entry whatever its revalidation
+          // decides, so only a miss can hand a vetoed result to the caller.
+          return { json: await matched.json(), vetoed: false };
         };
 
-        return await flights.do(request.url, staleWhileRevalidate);
+        const result = await flights.do(request.url, staleWhileRevalidate);
+        vetoed = result.vetoed;
+        if (vetoed) {
+          markResponseUncacheable({
+            cache: mode as CacheMode,
+            cacheKeyNull: false,
+            vetoed,
+          });
+        }
+        return result.json;
       } finally {
         const dimension = { loader, status };
         if (OTEL_ENABLE_EXTRA_METRICS) {
           stats.latency.record(performance.now() - start, dimension);
         }
-        ctx.monitoring?.currentSpan?.setDesc(status);
+        ctx.monitoring?.currentSpan?.setDesc(vetoed ? "miss-vetoed" : status);
       }
     },
   };
