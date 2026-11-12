@@ -22,7 +22,7 @@ import type {
 } from "../engine/middleware.ts";
 import type { DecoManifest, FnContext } from "../types.ts";
 import { resolversFrom } from "./appsUtil.ts";
-import { isInvokeCtx } from "./loader.ts";
+import { isInvokeCtx, type LoaderModule } from "./loader.ts";
 import { fnContextFromHttpContext } from "./utils.tsx";
 
 export type Apps = InstanceOf<AppRuntime, "#/root/apps">;
@@ -225,10 +225,27 @@ const injectAppStateOnManifest = <
         ...mod,
         default: injectAppState(state, mod.default),
         cacheKey: mod.cacheKey && injectAppState(state, mod.cacheKey),
+        shouldCache: mod.shouldCache &&
+          injectAppStateOnShouldCache(state, mod.shouldCache),
       }),
     ),
   };
 };
+
+/**
+ * Gives `shouldCache` the app state in its ctx, as `default` and `cacheKey`
+ * get it. It takes the result first, so it is adapted to injectAppState's
+ * (props, req, ctx) shape for the call. Exported for direct testability.
+ */
+export const injectAppStateOnShouldCache = <TState = any>(
+  state: TState,
+  shouldCache: NonNullable<LoaderModule["shouldCache"]>,
+): NonNullable<LoaderModule["shouldCache"]> =>
+(result, props, req, ctx) =>
+  injectAppState(
+    state,
+    (props, req, ctx) => shouldCache(result, props, req, ctx),
+  )(props, req, ctx);
 
 const isAppHttpContext = (
   ctx: AppHttpContext | BaseContext,
