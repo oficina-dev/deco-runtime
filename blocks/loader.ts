@@ -39,7 +39,8 @@ type CacheMode = "no-store" | "no-cache" | "stale-while-revalidate";
 export interface LoaderModule<
   TProps = any,
   TState = any,
-> extends BlockModule<FnProps<TProps>>, GateKeeperAccess {
+  TResult = any,
+> extends BlockModule<FnProps<TProps, TResult>>, GateKeeperAccess {
   /**
    * Specifies caching behavior for the loader and its dependencies.
    *
@@ -67,6 +68,28 @@ export interface LoaderModule<
     req: Request,
     ctx: FnContext<TState>,
   ) => string | null;
+
+  /**
+   * Decides whether a result the loader just produced may be written to the
+   * loader cache. Runs right before the write, both on a cache miss and on the
+   * background revalidation of a stale entry. Returning `false` hands the
+   * result to the caller without storing it, and leaves any existing entry
+   * untouched: after a miss the next request runs the loader again; after a
+   * revalidation the previous entry keeps being served (and revalidated) until
+   * an accepted result replaces it.
+   *
+   * Use it for answers that are valid to show once but harmful to repeat, such
+   * as an empty search result caused by a transient upstream failure — without
+   * throwing, which would turn the result into an error for every caller.
+   *
+   * When absent, every result is stored.
+   */
+  shouldCache?: (
+    result: TResult,
+    props: TProps,
+    req: Request,
+    ctx: FnContext<TState>,
+  ) => boolean;
 
   /** @deprecated use cacheKey instead */
   singleFlightKey?: SingleFlightKeyFunc<TProps, HttpContext>;
@@ -177,18 +200,25 @@ const noop = () => "";
  * - Reused TextEncoder instance to avoid repeated instantiation
  * - Optimized cache key generation using string concatenation
  * - Improved string concatenation for Content-Length header
+ *
+ * Exported for direct testability; the loader block's `adapt` is the only
+ * production caller.
  */
-const wrapLoader = (
+export const wrapLoader = (
   {
     default: handler,
     cache = "no-store",
     cacheKey = noop,
+    shouldCache,
     singleFlightKey,
     ...rest
   }: LoaderModule,
   resolveChain: FieldResolver[],
   release: DecofileProvider,
   blockKey: string,
+  // Read per call because the shared cache opens asynchronously at boot.
+  // Tests pass their own.
+  getCache: () => Cache | undefined = () => maybeCache,
 ) => {
   const [cacheMaxAge, mode] = typeof cache === "string"
     ? [MAX_AGE_S, cache]
@@ -225,7 +255,8 @@ const wrapLoader = (
       const start = performance.now();
       let status: "bypass" | "miss" | "stale" | "hit" | undefined;
 
-      const isCacheEngineDefined = isCache(maybeCache);
+      const loaderCache = getCache();
+      const isCacheEngineDefined = isCache(loaderCache);
       const isCacheDisabled = !ENABLE_LOADER_CACHE ||
         !isCacheEngineDefined;
 
@@ -243,7 +274,7 @@ const wrapLoader = (
           bypassCache ||
           // This code is unreachable, but the TS complains that cache is undefined because
           // it doesn't get that isCache is inside the bypassCache variable
-          !isCache(maybeCache)
+          !isCache(loaderCache)
         ) {
           const shouldNotCache = isCacheNoStore || isCacheKeyNull;
 
@@ -274,7 +305,7 @@ const wrapLoader = (
         ctx.vary?.push(loader, cacheKeyValue);
         RequestContext?.signal?.throwIfAborted();
 
-        const cache = maybeCache;
+        const cache = loaderCache;
 
         const timing = ctx.monitoring?.timings.start("loader-hash");
 
@@ -300,6 +331,10 @@ const wrapLoader = (
 
         const callHandlerAndCache = async () => {
           const json = await handler(props, req, ctx);
+
+          if (shouldCache && !shouldCache(json, props, req, ctx)) {
+            return json;
+          }
 
           // Serialize and encode once on the main thread.
           const jsonStringEncoded = textEncoder.encode(JSON.stringify(json));
